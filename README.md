@@ -1,7 +1,7 @@
 # haven
 
 ```
-npm install undici ethers dotenv
+npm install undici ethers dotenv bcryptjs cookie-parser jsonwebtoken 
 ```
 # .env
 ```
