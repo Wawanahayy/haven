@@ -1,46 +1,59 @@
 #!/usr/bin/env node
 /**
- * auto.mjs — SIWE login + daily checkin
+ * auto.mjs — SIWE login + daily checkin (multi akun)
  *
  * .env:
- *   ETH_PRIVATE_KEY=0x...
+ *   REFERRAL_CODE=xxxxxxx   (opsional, default: c28afdcb)
+ *   DEBUG=1                 (opsional)
+ *
+ * Private key:
+ *   privatekey.txt  → 1 line 1 akun
+ *     contoh:
+ *       0xabc123...
+ *       abc456...   (boleh tanpa 0x, nanti otomatis diprefix)
  *
  * Dep:
  *   npm install undici ethers dotenv
  */
 
 import 'dotenv/config';
+import fs from 'node:fs';
 import { request } from 'undici';
 import { Wallet } from 'ethers';
 
+/* ========= BASIC CONFIG ========= */
 
 const BASE_URL        = 'https://camphaven.xyz';
 const GRAPHQL_URL     = 'https://gql3.absinthe.network/v1/graphql';
-const POINT_SOURCE_ID = '9ac10efc-fd64-4db8-82bd-29b083a1a04b'; 
-const REFERRAL_CODE = process.env.REFERRAL_CODE || 'c28afdcb'; 
+const POINT_SOURCE_ID = '9ac10efc-fd64-4db8-82bd-29b083a1a04b'; // daily checkin point_source_id
+const REFERRAL_CODE   = process.env.REFERRAL_CODE || 'c28afdcb';
 const CHAIN_ID        = 1;
 const CONNECTOR_TAG   = 'connector://io.rabby';
 const CALLBACK_PATH   = '/home';
 
-const ETH_PRIVATE_KEY = process.env.ETH_PRIVATE_KEY;
 const DEBUG = String(process.env.DEBUG || '').trim() === '1';
 
-if (!ETH_PRIVATE_KEY) {
-  console.error('ERROR: ETH_PRIVATE_KEY belum di-set di .env');
-  process.exit(1);
-}
-
-let cookieJar = {
+/**
+ * Cookie awal dari pattern cURL:
+ *  client-season, domain, callback-url, redirect-pathname
+ */
+const INITIAL_COOKIE_JAR = {
   'client-season': 'd2ct-npic',
   'domain': 'https%3A%2F%2Fcamphaven.xyz',
   '__Secure-authjs.callback-url': 'https%3A%2F%2Fboost.absinthe.network',
   'redirect-pathname': '%2Fholders',
 };
 
+// cookieJar akan di-reset per akun
+let cookieJar = { ...INITIAL_COOKIE_JAR };
+
+/* ========= LOG HELPERS ========= */
+
 function dlog(...args) {
   if (DEBUG) console.log('[DEBUG]', ...args);
 }
 
+/* ========= COOKIE HELPERS ========= */
 
 function parseSetCookie(setCookieHeaders = []) {
   const jar = {};
@@ -67,6 +80,7 @@ function cookieJarToHeader(jar) {
     .join('; ');
 }
 
+/* ========= HTTP HELPER ========= */
 
 async function httpJson(method, url, { headers = {}, body } = {}) {
   dlog('HTTP', method, url);
@@ -103,6 +117,7 @@ async function httpJson(method, url, { headers = {}, body } = {}) {
   return { status: res.statusCode, json, text };
 }
 
+/* ========= SIWE MESSAGE BUILDER ========= */
 
 function buildSiweMessage({ domain, address, uri, chainId, nonce, issuedAt }) {
   const lines = [
@@ -123,6 +138,7 @@ function buildSiweMessage({ domain, address, uri, chainId, nonce, issuedAt }) {
   return lines.join('\n');
 }
 
+/* ========= GRAPHQL HELPERS ========= */
 
 async function gqlRequest({ token, operationName, query, variables }) {
   const payload = JSON.stringify({ operationName, query, variables });
@@ -146,7 +162,6 @@ async function applyReferralIfPossible({ token, userId }) {
     dlog('[REFERRAL] REFERRAL_CODE kosong, skip.');
     return;
   }
-
 
   const query = `
     mutation updateReferralCode($applyReferralCodeInput: ApplyReferralCodeInput!) {
@@ -191,14 +206,22 @@ async function applyReferralIfPossible({ token, userId }) {
   }
 }
 
+/* ========= PER-AKUN FLOW ========= */
 
-async function main() {
-  const wallet  = new Wallet(ETH_PRIVATE_KEY);
+async function runForPrivateKey(rawPk, idx) {
+  console.log('');
+  console.log('========================================');
+  console.log(`=== AKUN #${idx} — START ===============`);
+
+  // reset cookieJar untuk akun ini
+  cookieJar = { ...INITIAL_COOKIE_JAR };
+
+  const pk = rawPk.startsWith('0x') ? rawPk : `0x${rawPk}`;
+  const wallet  = new Wallet(pk);
   const address = await wallet.getAddress();
   const domain  = new URL(BASE_URL).host;
   const uri     = BASE_URL;
 
-  console.log('=== CAMPHAVEN AUTO BOT ===');
   console.log('[AUTO] Address    :', address);
   console.log('[AUTO] DEBUG mode :', DEBUG ? 'ON' : 'OFF');
 
@@ -208,16 +231,15 @@ async function main() {
   });
 
   if (csrfResp.status >= 400) {
-    console.error('[ERROR] Gagal ambil CSRF.');
-    process.exit(1);
+    throw new Error('[ERROR] Gagal ambil CSRF.');
   }
   if (!csrfResp.json || !csrfResp.json.csrfToken) {
-    console.error('[ERROR] Respon CSRF tidak valid.');
-    process.exit(1);
+    throw new Error('[ERROR] Respon CSRF tidak valid.');
   }
 
   const csrfToken = csrfResp.json.csrfToken;
 
+  // 2) Build & sign SIWE
   const issuedAt    = new Date().toISOString();
   const siweMessage = buildSiweMessage({
     domain,
@@ -256,17 +278,15 @@ async function main() {
   );
 
   if (loginResp.status >= 400) {
-    console.error('[ERROR] Login SIWE HTTP error.');
     dlog('[LOGIN] Body:', loginResp.text);
-    process.exit(1);
+    throw new Error('[ERROR] Login SIWE HTTP error.');
   }
   if (
     loginResp.json &&
     typeof loginResp.json.url === 'string' &&
     loginResp.json.url.includes('error=CredentialsSignin')
   ) {
-    console.error('[ERROR] Login SIWE ditolak: CredentialsSignin.');
-    process.exit(1);
+    throw new Error('[ERROR] Login SIWE ditolak: CredentialsSignin.');
   }
 
   console.log('[AUTO] Login SIWE: OK ✅');
@@ -284,13 +304,11 @@ async function main() {
   );
 
   if (sessResp.status >= 400) {
-    console.error('[ERROR] Gagal ambil session.');
-    process.exit(1);
+    throw new Error('[ERROR] Gagal ambil session.');
   }
   if (!sessResp.json || !sessResp.json.token || !sessResp.json.user) {
-    console.error('[ERROR] Session tidak berisi token/user.');
     dlog('[SESSION] Body:', sessResp.text);
-    process.exit(1);
+    throw new Error('[ERROR] Session tidak berisi token/user.');
   }
 
   const token = sessResp.json.token;
@@ -300,6 +318,7 @@ async function main() {
   dlog('[SESSION] clientSeason:', user.clientSeason);
   dlog('[SESSION] token:', token);
 
+  // 5) Referral (optional)
   await applyReferralIfPossible({ token, userId: user.id });
 
   // 6) Daily checkin
@@ -330,14 +349,53 @@ async function main() {
   });
 
   if (chkStatus >= 400 || (chkJson && chkJson.errors)) {
-    console.error('[ERROR] Checkin gagal.');
     dlog('[CHECKIN] Status:', chkStatus);
     dlog('[CHECKIN] Body  :', chkText);
-    process.exit(1);
+    throw new Error('[ERROR] Checkin gagal.');
   }
 
   console.log('[AUTO] Daily checkin: SUCCESS ✅');
-  console.log('=== DONE ===');
+  console.log(`=== AKUN #${idx} — DONE =================`);
+}
+
+/* ========= MAIN (MULTI ACCOUNT) ========= */
+
+async function main() {
+  console.log('=== CAMPHAVEN AUTO BOT (MULTI AKUN) ===');
+
+  // baca privatekey.txt
+  let fileContent;
+  try {
+    fileContent = fs.readFileSync('privatekey.txt', 'utf8');
+  } catch (e) {
+    console.error('ERROR: Gagal membaca privatekey.txt. Pastikan file ada di folder yang sama dengan auto.mjs');
+    process.exit(1);
+  }
+
+  const lines = fileContent
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith('#'));
+
+  if (lines.length === 0) {
+    console.error('ERROR: privatekey.txt kosong atau hanya berisi komentar.');
+    process.exit(1);
+  }
+
+  console.log(`[INFO] Ditemukan ${lines.length} akun di privatekey.txt`);
+
+  for (let i = 0; i < lines.length; i++) {
+    const rawPk = lines[i];
+    try {
+      await runForPrivateKey(rawPk, i + 1);
+    } catch (err) {
+      console.error(`[#${i + 1}] ERROR pada akun ini:`, err.message || err);
+      // lanjut ke akun berikutnya
+    }
+  }
+
+  console.log('');
+  console.log('=== ALL DONE ===');
 }
 
 main().catch((err) => {
