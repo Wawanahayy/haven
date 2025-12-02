@@ -25,7 +25,11 @@ import { Wallet } from 'ethers';
 
 const BASE_URL        = 'https://camphaven.xyz';
 const GRAPHQL_URL     = 'https://gql3.absinthe.network/v1/graphql';
-const POINT_SOURCE_ID = '9ac10efc-fd64-4db8-82bd-29b083a1a04b'; // daily checkin point_source_id
+
+// DISAMAKAN DENGAN cURL:
+const POINT_SOURCE_ID = '09b99963-757e-46fa-8b79-95d1cdbed7d5'; // daily checkin point_source_id (dari cURL)
+const CLIENT_SEASON   = 'd2ct-npic';                             // clientSeason dari cURL
+
 const REFERRAL_CODE   = process.env.REFERRAL_CODE || 'c28afdcb';
 const CHAIN_ID        = 1;
 const CONNECTOR_TAG   = 'connector://io.rabby';
@@ -38,7 +42,7 @@ const DEBUG = String(process.env.DEBUG || '').trim() === '1';
  *  client-season, domain, callback-url, redirect-pathname
  */
 const INITIAL_COOKIE_JAR = {
-  'client-season': 'd2ct-npic',
+  'client-season': CLIENT_SEASON,
   'domain': 'https%3A%2F%2Fcamphaven.xyz',
   '__Secure-authjs.callback-url': 'https%3A%2F%2Fboost.absinthe.network',
   'redirect-pathname': '%2Fholders',
@@ -206,6 +210,73 @@ async function applyReferralIfPossible({ token, userId }) {
   }
 }
 
+/**
+ * getDailyCheckinCompletions — DISAMAKAN DENGAN cURL:
+ *
+ * query getDailyCheckinCompletions($clientSeason: String!, $userId: uuid!, $pointSourceId: uuid!) {
+ *   data_ingestion_point_source_completions(
+ *     where: {
+ *       _and: {
+ *         client_season: { _eq: $clientSeason },
+ *         user_id: { _eq: $userId },
+ *         status: { _eq: SUCCESS },
+ *         point_source_id: { _eq: $pointSourceId }
+ *       }
+ *     }
+ *     order_by: { created_at: desc }
+ *   ) {
+ *     created_at
+ *     __typename
+ *   }
+ * }
+ */
+async function getDailyCheckinCompletions({ token, userId }) {
+  const query = `
+    query getDailyCheckinCompletions($clientSeason: String!, $userId: uuid!, $pointSourceId: uuid!) {
+      data_ingestion_point_source_completions(
+        where: {
+          _and: {
+            client_season: { _eq: $clientSeason },
+            user_id: { _eq: $userId },
+            status: { _eq: SUCCESS },
+            point_source_id: { _eq: $pointSourceId }
+          }
+        }
+        order_by: { created_at: desc }
+      ) {
+        created_at
+        __typename
+      }
+    }
+  `;
+
+  const variables = {
+    clientSeason: CLIENT_SEASON,
+    userId,
+    pointSourceId: POINT_SOURCE_ID,
+  };
+
+  const { status, json, text } = await gqlRequest({
+    token,
+    operationName: 'getDailyCheckinCompletions',
+    query,
+    variables,
+  });
+
+  if (status >= 400) {
+    dlog('[CHECKIN-QUERY] HTTP error:', status, text);
+    return null;
+  }
+
+  if (json && json.errors) {
+    dlog('[CHECKIN-QUERY] GraphQL errors:', json.errors);
+    return null;
+  }
+
+  const arr = json?.data?.data_ingestion_point_source_completions || [];
+  return arr;
+}
+
 /* ========= PER-AKUN FLOW ========= */
 
 async function runForPrivateKey(rawPk, idx) {
@@ -315,14 +386,36 @@ async function runForPrivateKey(rawPk, idx) {
   const user  = sessResp.json.user;
 
   console.log('[AUTO] Login sebagai user:', user.id);
-  dlog('[SESSION] clientSeason:', user.clientSeason);
+  dlog('[SESSION] clientSeason (from session):', user.clientSeason);
   dlog('[SESSION] token:', token);
 
   // 5) Referral (optional)
   await applyReferralIfPossible({ token, userId: user.id });
 
-  // 6) Daily checkin
-  console.log('[AUTO] Daily checkin...');
+  // 6) getDailyCheckinCompletions (sama dengan cURL kedua)
+  console.log('[AUTO] Cek riwayat daily checkin...');
+  const completions = await getDailyCheckinCompletions({ token, userId: user.id });
+
+  if (Array.isArray(completions) && completions.length > 0) {
+    const latest = completions[0].created_at;
+    console.log(`[AUTO] Latest checkin created_at: ${latest}`);
+
+    // bandingkan pakai tanggal (YYYY-MM-DD) dari created_at vs hari ini (UTC)
+    const todayUtc = new Date().toISOString().slice(0, 10);
+    const latestDate = String(latest).slice(0, 10);
+
+    if (latestDate === todayUtc) {
+      console.log('[AUTO] Sudah checkin hari ini (berdasarkan created_at). SKIP ✅');
+      console.log(`=== AKUN #${idx} — DONE (SKIP CHECKIN) ========`);
+      return;
+    }
+  } else {
+    console.log('[AUTO] Belum ada riwayat checkin / tidak ada data.');
+  }
+
+  // 7) Daily checkin (sama dengan cURL pertama: upsertDailyCheckin)
+  console.log('[AUTO] Daily checkin (upsertDailyCheckin)...');
+
   const gqlQuery = `
     mutation upsertDailyCheckin($object: DailyCheckinInput!) {
       daily_checkin(point_source_data: $object) {
@@ -335,7 +428,7 @@ async function runForPrivateKey(rawPk, idx) {
   const gqlVariables = {
     object: {
       user_id: user.id,
-      client_season: user.clientSeason,
+      client_season: CLIENT_SEASON,    // DISAMAKAN DENGAN cURL (bukan dari session)
       point_source_id: POINT_SOURCE_ID,
       status: 'SUCCESS',
     },
